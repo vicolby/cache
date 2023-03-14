@@ -1,40 +1,55 @@
 package main
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/vicolby/cache/cache"
+	"github.com/vicolby/cache/client"
+	"github.com/vicolby/cache/proto"
 )
 
 type ServerOpts struct {
 	ListenAddr string
 	IsLeader   bool
+	LeaderAddr string
 }
 
 type Server struct {
-	opts  ServerOpts
-	cache cache.Cacher
+	ServerOpts
+	members map[*client.Client]struct{}
+	cache   cache.Cacher
 }
 
 func NewServer(opts ServerOpts, c cache.Cacher) *Server {
 	return &Server{
-		opts:  opts,
-		cache: c,
+		ServerOpts: opts,
+		cache:      c,
+		members:    make(map[*client.Client]struct{}),
 	}
 }
 
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.opts.ListenAddr)
+	ln, err := net.Listen("tcp", s.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	log.Printf("Server listening on [%s] \n", s.opts.ListenAddr)
+	if !s.IsLeader && len(s.LeaderAddr) != 0 {
+		go func() {
+			if err := s.dialLeader(); err != nil {
+				log.Println(err)
+			}
+		}()
+	}
+
+	log.Printf("Server starting on port [%s] \n", s.ListenAddr)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -45,93 +60,93 @@ func (s *Server) Start() error {
 	}
 }
 
+func (s *Server) dialLeader() error {
+	conn, err := net.Dial("tcp", s.LeaderAddr)
+	if err != nil {
+		return fmt.Errorf("failed to dial leader: [%s]", s.LeaderAddr)
+	}
+
+	log.Println("connected to leader:", s.LeaderAddr)
+
+	binary.Write(conn, binary.LittleEndian, proto.CmdJoin)
+
+	s.handleConn(conn)
+
+	return nil
+}
+
 func (s *Server) handleConn(conn net.Conn) {
-	defer func() {
-		conn.Close()
-	}()
-	buf := make([]byte, 2048)
+	defer conn.Close()
+
 	for {
-		n, err := conn.Read(buf)
+		cmd, err := proto.ParseCommand(conn)
 		if err != nil {
-			log.Printf("failed to read: %s \n", err)
+			if err == io.EOF {
+				break
+			}
+			log.Println("parse command error:", err)
 			break
 		}
-		go s.handleCommand(buf[:n], conn)
-
+		go s.handleCommand(conn, cmd)
 	}
 }
 
-func (s *Server) handleCommand(rawCmd []byte, conn net.Conn) {
-	cmd, err := parseCommand(rawCmd)
+func (s *Server) handleCommand(conn net.Conn, cmd any) {
+	switch v := cmd.(type) {
+	case *proto.CommandSet:
+		s.handleSetCommand(conn, v)
+	case *proto.CommandGet:
+		s.handleGetCommand(conn, v)
+	case *proto.CommandJoin:
+		s.handleJoinCommand(conn, v)
+	}
+}
+
+func (s *Server) handleJoinCommand(conn net.Conn, cmd *proto.CommandJoin) error {
+	fmt.Println("member jst joined the cluster:", conn.RemoteAddr())
+
+	s.members[client.NewFromConn(conn)] = struct{}{}
+
+	return nil
+}
+
+func (s *Server) handleGetCommand(conn net.Conn, cmd *proto.CommandGet) error {
+	resp := &proto.ResponseGet{}
+	value, err := s.cache.Get(cmd.Key)
 	if err != nil {
-		log.Printf("failed to parse command: %s \n", err)
-		return
+		resp.Status = proto.StatusError
+		_, err := conn.Write(resp.Bytes())
+		return err
 	}
 
-	switch cmd.Command {
-	case "SET":
-		err := s.cache.Set(cmd.Key, cmd.Value, cmd.TTL)
-		if err != nil {
-			log.Printf("failed to set: %s \n", err)
-			return
-		}
-		conn.Write([]byte("OK"))
+	resp.Status = proto.StatusOK
+	resp.Value = value
+	_, err = conn.Write(resp.Bytes())
 
-	case "GET":
-		val, err := s.cache.Get(cmd.Key)
-		if err != nil {
-			log.Printf("failed to set: %s \n", err)
-			return
-		}
-		conn.Write(val)
-
-	case "HAS":
-		has := s.cache.Has(cmd.Key)
-		if has {
-			conn.Write([]byte("OK"))
-		} else {
-			conn.Write([]byte("NOT FOUND"))
-		}
-	case "DEL":
-		err := s.cache.Delete(cmd.Key)
-		if err != nil {
-			log.Printf("failed to delete: %s \n", err)
-			return
-		}
-		conn.Write([]byte("OK"))
-	}
+	return err
 }
 
-func parseCommand(rawCmd []byte) (*Message, error) {
-	parts := strings.Split(string(rawCmd), " ")
+func (s *Server) handleSetCommand(conn net.Conn, cmd *proto.CommandSet) error {
+	log.Printf("SET key: [%s] value: [%s] \n", cmd.Key, cmd.Value)
 
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid command")
+	go func() {
+		for member := range s.members {
+			err := member.Set(context.TODO(), cmd.Key, cmd.Value, cmd.TTL)
+			if err != nil {
+				log.Println("forward to member error:", err)
+			}
+		}
+	}()
+
+	resp := proto.ResponseSet{}
+	if err := s.cache.Set(cmd.Key, cmd.Value, time.Duration(cmd.TTL)); err != nil {
+		resp.Status = proto.StatusError
+		_, err := conn.Write(resp.Bytes())
+		return err
 	}
 
-	cmd := parts[0]
-	switch cmd {
-	case "SET":
-		if len(parts) < 4 {
-			return nil, fmt.Errorf("invalid set command")
-		}
-		key := []byte(parts[1])
-		value := []byte(parts[2])
-		ttl, err := strconv.Atoi(parts[3])
-		if err != nil {
-			return nil, fmt.Errorf("invalid ttl")
-		}
-		return &Message{Command: Command(cmd), Key: key, Value: value, TTL: time.Duration(ttl) * time.Second}, nil
-	case "GET":
-		key := []byte(parts[1])
-		return &Message{Command: Command(cmd), Key: key}, nil
-	case "HAS":
-		key := []byte(parts[1])
-		return &Message{Command: Command(cmd), Key: key}, nil
-	case "DEL":
-		key := []byte(parts[1])
-		return &Message{Command: Command(cmd), Key: key}, nil
-	default:
-		return nil, fmt.Errorf("invalid command %s", cmd)
-	}
+	resp.Status = proto.StatusOK
+	_, err := conn.Write(resp.Bytes())
+
+	return err
 }
